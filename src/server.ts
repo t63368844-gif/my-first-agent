@@ -1,6 +1,6 @@
 import { createWorkersAI } from "workers-ai-provider";
 import { callable, routeAgentRequest, type Schedule } from "agents";
-import { getSchedulePrompt, scheduleSchema } from "agents/schedule";
+import { getSchedulePrompt } from "agents/schedule";
 import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
 import {
   convertToModelMessages,
@@ -14,12 +14,9 @@ import { z } from "zod";
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
   chatRecovery = true;
-  // Wait for MCP connections to be re-established after hibernation before
-  // processing a message, so MCP tools aren't intermittently missing.
   waitForMcpConnections = true;
 
   onStart() {
-    // Configure OAuth popup behavior for MCP servers that require authentication
     this.mcp.configureOAuthCallback({
       customHandler: (result) => {
         if (result.authSuccess) {
@@ -58,57 +55,50 @@ export class ChatAgent extends AIChatAgent<Env> {
 
 ${getSchedulePrompt({ date: new Date() })}
 
-If the user asks to schedule a task, use the schedule tool to schedule the task.`,
-      // Prune old tool calls and reasoning to save tokens on long conversations
+If the user asks to schedule a task, use the scheduleTask tool with a clear "when" string (e.g. "in 30 seconds", "in 5 minutes", "2026-01-15T09:00:00Z", or a cron expression like "*/10 * * * *"). Always provide BOTH the "when" and "description" parameters.`,
       messages: pruneMessages({
         messages: await convertToModelMessages(this.messages),
         toolCalls: "before-last-2-messages",
         reasoning: "before-last-message"
       }),
       tools: {
-        // MCP tools from connected servers
         ...mcpTools,
 
-        // Server-side tool: runs automatically on the server
+        // ── Server-side: weather ────────────────────────────────
         getWeather: tool({
           description: "Get the current weather for a city",
           inputSchema: z.object({
             city: z.string().describe("City name")
           }),
           execute: async ({ city }) => {
-            // Replace with a real weather API in production
             const conditions = ["sunny", "cloudy", "rainy", "snowy"];
             const temp = Math.floor(Math.random() * 30) + 5;
             return {
               city,
               temperature: temp,
-              condition:
-                conditions[Math.floor(Math.random() * conditions.length)],
+              condition: conditions[Math.floor(Math.random() * conditions.length)],
               unit: "celsius"
             };
           }
         }),
 
-        // Client-side tool: no execute function — the browser handles it
+        // ── Client-side: timezone ──────────────────────────────
         getUserTimezone: tool({
           description:
             "Get the user's timezone from their browser. Use this when you need to know the user's local time.",
           inputSchema: z.object({})
         }),
 
-        // Approval tool: requires user confirmation before executing
+        // ── Approval tool: calculator ──────────────────────────
         calculate: tool({
           description:
             "Perform a math calculation with two numbers. Requires user approval for large numbers.",
           inputSchema: z.object({
             a: z.number().describe("First number"),
             b: z.number().describe("Second number"),
-            operator: z
-              .enum(["+", "-", "*", "/", "%"])
-              .describe("Arithmetic operator")
+            operator: z.enum(["+", "-", "*", "/", "%"]).describe("Arithmetic operator")
           }),
-          needsApproval: async ({ a, b }) =>
-            Math.abs(a) > 1000 || Math.abs(b) > 1000,
+          needsApproval: async ({ a, b }) => Math.abs(a) > 1000 || Math.abs(b) > 1000,
           execute: async ({ a, b, operator }) => {
             const ops: Record<string, (x: number, y: number) => number> = {
               "+": (x, y) => x + y,
@@ -117,9 +107,7 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
               "/": (x, y) => x / y,
               "%": (x, y) => x % y
             };
-            if (operator === "/" && b === 0) {
-              return { error: "Division by zero" };
-            }
+            if (operator === "/" && b === 0) return { error: "Division by zero" };
             return {
               expression: `${a} ${operator} ${b}`,
               result: ops[operator](a, b)
@@ -127,34 +115,56 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
           }
         }),
 
+        // ── FIXED scheduleTask: simple schema, null-guarded ────
         scheduleTask: tool({
           description:
-            "Schedule a task to be executed at a later time. Use this when the user asks to be reminded or wants something done later.",
-          inputSchema: scheduleSchema,
-          execute: async ({ when, description }) => {
-            if (when.type === "no-schedule") {
-              return "Not a valid schedule input";
-            }
-            const input =
-              when.type === "scheduled"
-                ? when.date
-                : when.type === "delayed"
-                  ? when.delayInSeconds
-                  : when.type === "cron"
-                    ? when.cron
-                    : null;
-            if (!input) return "Invalid schedule type";
+            "Schedule a task to be executed at a later time. Use this when the user asks to be reminded or wants something done later. You MUST provide BOTH 'when' and 'description' parameters.",
+          inputSchema: z.object({
+            when: z
+              .string()
+              .describe(
+                'When to run the task. Examples: "in 30 seconds", "in 5 minutes", "2026-01-15T09:00:00Z", or a cron expression like "*/10 * * * *"'
+              ),
+            description: z.string().describe("A description of what the task should do")
+          }),
+          execute: async ({ when: whenStr, description }) => {
             try {
-              this.schedule(input, "executeTask", description, {
+              // ── Null guard: protect against empty input from the model
+              if (!whenStr || typeof whenStr !== "string" || whenStr.trim() === "") {
+                return "ERROR: missing 'when' parameter. Please specify when to schedule (e.g. 'in 30 seconds').";
+              }
+              if (!description || typeof description !== "string" || description.trim() === "") {
+                return "ERROR: missing 'description' parameter. Please describe what to schedule.";
+              }
+
+              let input: number | Date | string;
+              const delayMatch = whenStr.match(/in\s+(\d+)\s+(second|minute|hour)s?/i);
+              const asNum = Number(whenStr);
+
+              if (delayMatch) {
+                const val = parseInt(delayMatch[1]);
+                const unit = delayMatch[2].toLowerCase();
+                input = unit === "second" ? val : unit === "minute" ? val * 60 : val * 3600;
+              } else if (!isNaN(asNum) && whenStr.trim() !== "") {
+                input = asNum;
+              } else if (whenStr.includes("*")) {
+                input = whenStr; // cron expression
+              } else {
+                input = new Date(whenStr);
+              }
+
+              await this.schedule(input, "executeTask", description, {
                 idempotent: true
               });
-              return `Task scheduled: "${description}" (${when.type}: ${input})`;
+              return `Task scheduled successfully: "${description}" for ${whenStr}`;
             } catch (error) {
-              return `Error scheduling task: ${error}`;
+              const msg = error instanceof Error ? error.message : String(error);
+              return `Error scheduling task: ${msg}`;
             }
           }
         }),
 
+        // ── List scheduled tasks ───────────────────────────────
         getScheduledTasks: tool({
           description: "List all tasks that have been scheduled",
           inputSchema: z.object({}),
@@ -164,6 +174,7 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
           }
         }),
 
+        // ── Cancel a scheduled task ────────────────────────────
         cancelScheduledTask: tool({
           description: "Cancel a scheduled task by its ID",
           inputSchema: z.object({
@@ -174,12 +185,13 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
               this.cancelSchedule(taskId);
               return `Task ${taskId} cancelled.`;
             } catch (error) {
-              return `Error cancelling task: ${error}`;
+              const msg = error instanceof Error ? error.message : String(error);
+              return `Error cancelling task: ${msg}`;
             }
           }
         })
       },
-      stopWhen: stepCountIs(20),
+      stopWhen: stepCountIs(10),
       abortSignal: options?.abortSignal
     });
 
@@ -187,13 +199,7 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
   }
 
   async executeTask(description: string, _task: Schedule<string>) {
-    // Do the actual work here (send email, call API, etc.)
     console.log(`Executing scheduled task: ${description}`);
-
-    // Notify connected clients via a broadcast event.
-    // We use broadcast() instead of saveMessages() to avoid injecting
-    // into chat history — that would cause the AI to see the notification
-    // as new context and potentially loop.
     this.broadcast(
       JSON.stringify({
         type: "scheduled-task",
