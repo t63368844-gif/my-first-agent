@@ -41,14 +41,18 @@ function translit(s: string): string {
   return s.toLowerCase().split("").map((ch) => TRANSLIT[ch] ?? ch).join("");
 }
 
+// ── Тип колбэка прогресса: tool докладывает о каждом шаге ─────
+type EmitFn = (step: string, message: string, status?: "start" | "done" | "error") => void;
+
 // ── Геокодинг: ТОЛЬКО точное совпадение, иначе эскалация ───────
-async function geocode(city: string): Promise<{ lat: number; lon: number; name: string; region: string; source: string } | null> {
+async function geocode(city: string, emit?: EmitFn): Promise<{ lat: number; lon: number; name: string; region: string; source: string } | null> {
   const key = city.trim().toLowerCase();
 
   // Слой 1: словарь — мгновенно и без сети
   const local = KNOWN_CITIES[key];
   if (local) {
     console.log(`[GEO] layer1 dict: "${city}" → (${local.lat}, ${local.lon})`);
+    emit?.("geo", `Координаты «${city}» найдены в словаре`, "done");
     return { lat: local.lat, lon: local.lon, name: city, region: local.region, source: "dict" };
   }
 
@@ -63,9 +67,11 @@ async function geocode(city: string): Promise<{ lat: number; lon: number; name: 
       const exact = list.find((r) => r.name.trim().toLowerCase() === q.trim().toLowerCase());
       if (exact) {
         console.log(`[GEO] layer2 open-meteo(${lang}) EXACT: "${q}" → (${exact.latitude}, ${exact.longitude})`);
+        emit?.("geo", `Open-Meteo (${lang}): точное совпадение «${exact.name}»`, "done");
         return { lat: exact.latitude, lon: exact.longitude, name: exact.name, region: exact.admin1 ?? "", source: `open-meteo:${lang}` };
       }
       console.log(`[GEO] layer2 open-meteo(${lang}): ${list.length} candidates, NO exact match — rejected: ` + list.map((r) => r.name).join(", "));
+        emit?.("geo", `Open-Meteo (${lang}): точного совпадения нет, отклонено кандидатов: ${list.length}`, "error");
     } catch (e) {
       console.log(`[GEO] layer2 open-meteo(${lang}) error:`, e);
     }
@@ -80,6 +86,7 @@ async function geocode(city: string): Promise<{ lat: number; lon: number; name: 
     const arr = await res.json() as Array<{ lat: string; lon: string; display_name: string }>;
     if (arr?.[0]) {
       console.log(`[GEO] layer3 nominatim: "${city}" → (${arr[0].lat}, ${arr[0].lon})`);
+      emit?.("geo", `OpenStreetMap: «${city}» найден`, "done");
       return { lat: parseFloat(arr[0].lat), lon: parseFloat(arr[0].lon), name: city, region: arr[0].display_name, source: "osm" };
     }
   } catch (e) {
@@ -87,17 +94,19 @@ async function geocode(city: string): Promise<{ lat: number; lon: number; name: 
   }
 
   console.log(`[GEO] ALL LAYERS FAILED for "${city}"`);
+  emit?.("geo", `«${city}» не найден ни в одном источнике`, "error");
   return null;
 }
 
 // ── Реальная погода через open-meteo.com ─────────────────────
-async function fetchWeather(city: string): Promise<{ temp: number; condition: string; city: string }> {
+async function fetchWeather(city: string, emit?: EmitFn): Promise<{ temp: number; condition: string; city: string }> {
   try {
-    const place = await geocode(city);
+    const place = await geocode(city, emit);
     if (!place) {
       return { temp: 0, condition: "город не найден: ни один источник не дал точного совпадения", city };
     }
 
+    emit?.("weather", "Запрашиваю погоду у Open-Meteo…", "start");
     const wxRes = await fetch(
       `https://api.open-meteo.com/v1/forecast?latitude=${place.lat}&longitude=${place.lon}&current=temperature_2m,weather_code`
     );
@@ -111,6 +120,7 @@ async function fetchWeather(city: string): Promise<{ temp: number; condition: st
     else if (code >= 71 && code <= 77) condition = "снег";
     else if (code >= 95) condition = "гроза";
 
+    emit?.("weather", `${place.name}: ${temp}°C, ${condition}`, "done");
     console.log(`[WORKER] fetchWeather: ${city} → ${place.name} [${place.source}] (${place.lat}, ${place.lon}) → ${temp}°C, ${condition}`);
     return { temp, condition, city: place.name };
   } catch (e) {
@@ -121,6 +131,12 @@ async function fetchWeather(city: string): Promise<{ temp: number; condition: st
 
 // ── Агент ────────────────────────────────────────────────────
 export class ChatAgent extends AIChatAgent<Env> {
+  progress(step: string, message: string, status: "start" | "done" | "error" = "start") {
+    const payload = JSON.stringify({ type: "progress", step, message, status, ts: Date.now() });
+    this.broadcast(payload);
+    console.log(`[PROGRESS:${status}] ${step}: ${message}`);
+  }
+
   async onChatMessage() {
     const workersai = createWorkersAI({ binding: this.env.AI });
 
@@ -165,7 +181,7 @@ Agent workflow:
           }),
           execute: async ({ city }) => {
             console.log(`[TOOL] getWeather called with city="${city}"`);
-            const result = await fetchWeather(city);
+            const result = await fetchWeather(city, (st, msg, status = "start") => this.progress(st, msg, status));
             console.log(`[TOOL] getWeather result:`, result);
             return result;
           },

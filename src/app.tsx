@@ -276,6 +276,10 @@ function Chat() {
     tools: []
   });
   const [showMcpPanel, setShowMcpPanel] = useState(false);
+  const [progress, setProgress] = useState<
+    Array<{ id: number; step: string; message: string; status: string; ts: number }>
+  >([]);
+  const [feedOpen, setFeedOpen] = useState(true);
   const [mcpName, setMcpName] = useState("");
   const [mcpUrl, setMcpUrl] = useState("");
   const [isAddingServer, setIsAddingServer] = useState(false);
@@ -302,6 +306,18 @@ function Chat() {
               description: data.description,
               timeout: 0
             });
+          }
+          if (data.type === "progress") {
+            setProgress((prev) => [
+              ...prev.slice(-49),
+              {
+                id: Date.now() + Math.random(),
+                step: data.step,
+                message: data.message,
+                status: data.status,
+                ts: data.ts
+              }
+            ]);
           }
         } catch {
           // Not JSON or not our event
@@ -848,6 +864,41 @@ function Chat() {
 
       {/* Input */}
       <div className="border-t border-kumo-line bg-kumo-base">
+        {/* Live progress feed: внизу, рядом со свежим ответом */}
+        {progress.length > 0 && (
+          <div className="max-w-3xl mx-auto px-5 pt-2">
+            <div className="flex items-center justify-between">
+              <button
+                type="button"
+                onClick={() => setFeedOpen((v) => !v)}
+                className="text-xs font-mono text-kumo-subtle flex items-center gap-1"
+              >
+                <span>{feedOpen ? "▾" : "▸"} ⚡ Live feed: {progress.length} соб.</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setProgress([])}
+                className="text-xs font-mono text-kumo-inactive"
+              >
+                ✕ очистить
+              </button>
+            </div>
+            {feedOpen && (
+              <div className="mt-1 mb-1 flex flex-col gap-1 max-h-28 overflow-y-auto rounded-lg bg-kumo-control p-2">
+                {progress.slice(-6).map((ev) => (
+                  <div key={ev.id} className="flex items-center gap-2 text-xs font-mono">
+                    <span>{ev.status === "done" ? "✅" : ev.status === "error" ? "⛔" : "⏳"}</span>
+                    <span className="text-kumo-inactive">
+                      {new Date(ev.ts).toLocaleTimeString()}
+                    </span>
+                    <span className="text-kumo-subtle">[{ev.step}]</span>
+                    <span className="text-kumo-default">{ev.message}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         <form
           onSubmit={(e) => {
             e.preventDefault();

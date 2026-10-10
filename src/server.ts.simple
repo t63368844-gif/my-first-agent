@@ -1,0 +1,77 @@
+// ── ИМПОРТЫ: кто есть кто ──────────────────────────────────
+import { routeAgentRequest } from "agents";                          // маршрутизатор SDK
+import { AIChatAgent } from "@cloudflare/ai-chat";                   // ← ВОТ ОН, базовый класс
+import { createWorkersAI } from "workers-ai-provider";                // провайдер Workers AI
+import { streamText, convertToModelMessages, tool, stepCountIs } from "ai";  // Vercel AI SDK
+import { z } from "zod";                                              // схема для tool
+
+// ── Вспомогательная функция: фейковая погода ──────────────
+async function fetchWeather(city: string): Promise<{ temp: number; condition: string }> {
+  try {
+    // 1. Геокодинг: город → координаты
+    const geoRes = await fetch(
+      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=ru`
+    );
+    const geo = await geoRes.json() as { results?: Array<{ latitude: number; longitude: number; name: string }> };
+    if (!geo.results?.[0]) {
+      return { temp: 0, condition: "unknown (city not found)" };
+    }
+    const { latitude, longitude } = geo.results[0];
+
+    // 2. Погода по координатам
+    const wxRes = await fetch(
+      `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,weather_code`
+    );
+    const wx = await wxRes.json() as { current: { temperature_2m: number; weather_code: number } };
+    const temp = Math.round(wx.current.temperature_2m);
+    
+    // WMO weather codes → условие
+    const code = wx.current.weather_code;
+    let condition = "cloudy";
+    if (code === 0 || code === 1) condition = "sunny";
+    else if (code >= 2 && code <= 3) condition = "cloudy";
+    else if (code >= 51 && code <= 67) condition = "rainy";
+    else if (code >= 71 && code <= 77) condition = "snowy";
+    else if (code >= 95) condition = "stormy";
+
+    return { temp, condition };
+  } catch (e) {
+    console.log("Open-Meteo failed, falling back:", e);
+    return { temp: 15, condition: "unknown (API error)" };
+  }
+}
+
+// ── Агент: минимальный рабочий вариант ────────────────────
+export class ChatAgent extends AIChatAgent<Env> {
+  async onChatMessage() {
+    const workersai = createWorkersAI({ binding: this.env.AI });
+    
+    const result = streamText({
+      model: workersai("@cf/zai-org/glm-4.7-flash"),
+      messages: await convertToModelMessages(this.messages),
+      tools: {
+        getWeather: tool({
+          description: "Get weather for a city",
+          inputSchema: z.object({ city: z.string() }),
+          execute: async ({ city }) => {
+            const data = await fetchWeather(city);
+            return { temperature: data.temp, condition: data.condition };
+          },
+        }),
+      },
+      stopWhen: stepCountIs(5),
+    });
+    
+    return result.toUIMessageStreamResponse();
+  }
+}
+
+// ── Точка входа: маршрутизация запросов ───────────────────
+export default {
+  async fetch(request: Request, env: Env) {
+    return (
+      (await routeAgentRequest(request, env)) ||
+      new Response("Not found", { status: 404 })
+    );
+  },
+} satisfies ExportedHandler<Env>;
