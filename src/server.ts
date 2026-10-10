@@ -155,6 +155,24 @@ export class ChatAgent extends AIChatAgent<Env> {
    - agents sdk
    - websocket
 3. **generateReport** — create a structured report after completing a multi-step task
+4. **translateText** — translate text between languages (codes: ru, en, de, fr, es, zh, ja…)
+5. **summarizeText** — compress a long text into 1-3 sentences (works best on English text)
+
+Chain rule: if the user asks to summarize NON-English text, first call translateText (to English),
+then summarizeText the translated text, and finish with generateReport listing both workers.
+
+## CRITICAL RULE — NEVER bypass workers:
+Even if you can do a task yourself (translate, summarize, answer a question), you MUST use the corresponding worker tool.
+The purpose of this agent is to DEMONSTRATE worker orchestration, not to answer directly.
+
+Mandatory mapping:
+- User asks to TRANSLATE → you MUST call translateText (do not translate yourself)
+- User asks to SUMMARIZE → you MUST call summarizeText (do not summarize yourself)
+- User asks about WEATHER → you MUST call getWeather (do not guess)
+- User asks about a TOPIC → you MUST call searchKnowledge first (do not rely on your training data)
+- Any task involving 2+ workers → you MUST finish with generateReport
+
+If you answer directly without calling a worker, the response is considered INCOMPLETE and WRONG.
 
 ## Workflow rules:
 - For weather questions → use getWeather
@@ -196,6 +214,7 @@ Agent workflow:
           execute: async ({ query }) => {
             console.log(`[TOOL] searchKnowledge called with query="${query}"`);
             
+            this.progress("rag", `Ищу в базе знаний: «${query}»…`, "start");
             // Имитация задержки worker'а (как реальный RAG)
             await new Promise(resolve => setTimeout(resolve, 300));
             
@@ -213,6 +232,7 @@ Agent workflow:
               searchTime: "300ms",
             };
             
+            this.progress("rag", result.found ? `Найдено: ${result.topic}` : "Не найдено", result.found ? "done" : "error");
             console.log(`[TOOL] searchKnowledge result:`, result);
             return result;
           },
@@ -230,6 +250,7 @@ Agent workflow:
             })).describe("List of workers that were called"),
           }),
           execute: async ({ task, workers }) => {
+            this.progress("report", `Формирую отчёт по задаче: "${task.slice(0, 50)}…"`, "start");
             console.log(`[TOOL] generateReport called with task="${task}", workers:`, workers);
             
             const report = {
@@ -242,8 +263,51 @@ Agent workflow:
               summary: `Задача "${task}" выполнена с использованием ${workers.length} worker(ов): ${workers.map(w => w.name).join(", ")}`,
             };
             
+            this.progress("report", `Отчёт готов: ${workers.length} worker(ов)`, "done");
             console.log(`[TOOL] generateReport result:`, report);
             return report;
+          },
+        }),
+
+        // ── Worker 4: перевод (Workers AI M2M100) ────────────────
+        translateText: tool({
+          description: "Translate text between languages using M2M100. Language codes: ru, en, de, fr, es, zh, ja, etc.",
+          inputSchema: z.object({
+            text: z.string().describe("Text to translate"),
+            source_lang: z.string().describe("Source language code, e.g. 'ru'"),
+            target_lang: z.string().describe("Target language code, e.g. 'en'"),
+          }),
+          execute: async ({ text, source_lang, target_lang }) => {
+            this.progress("translate", `Перевожу ${source_lang} → ${target_lang}…`, "start");
+            const res = (await this.env.AI.run("@cf/meta/m2m100-1.2b", {
+              text,
+              source_lang,
+              target_lang,
+            })) as { translated_text?: string };
+            this.progress("translate", `Перевод готов: ${(res.translated_text ?? "").slice(0, 60)}`, "done");
+            return { translated_text: res.translated_text ?? "" };
+          },
+        }),
+
+        // ── Worker 5: суммаризация (через chat-модель) ───────────
+        summarizeText: tool({
+          description: "Summarize a long text into 1-3 sentences. Works with any language.",
+          inputSchema: z.object({
+            text: z.string().describe("Long text to summarize"),
+            language: z.string().optional().describe("Output language (e.g. 'en', 'ru'). Defaults to input language."),
+          }),
+          execute: async ({ text, language }) => {
+            this.progress("summarize", `Сжимаю текст (${text.length} символов)…`, "start");
+            const lang = language ?? "same as input";
+            const res = await streamText({
+              model: workersai("@cf/zai-org/glm-4.7-flash"),
+              system: `You are a summarization assistant. Compress the following text into 2-3 concise sentences. Output language: ${lang}. Do NOT add commentary, just the summary.`,
+              prompt: text,
+              maxTokens: 150,
+            });
+            const summary = (await res.text).trim();
+            this.progress("summarize", "Сводка готова", "done");
+            return { summary };
           },
         }),
       },
