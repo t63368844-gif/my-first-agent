@@ -1,212 +1,240 @@
+import { routeAgentRequest } from "agents";
+import { AIChatAgent } from "@cloudflare/ai-chat";
 import { createWorkersAI } from "workers-ai-provider";
-import { callable, routeAgentRequest, type Schedule } from "agents";
-import { getSchedulePrompt } from "agents/schedule";
-import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
-import {
-  convertToModelMessages,
-  pruneMessages,
-  stepCountIs,
-  streamText,
-  tool
-} from "ai";
+import { streamText, convertToModelMessages, tool, stepCountIs } from "ai";
 import { z } from "zod";
 
-export class ChatAgent extends AIChatAgent<Env> {
-  maxPersistedMessages = 100;
-  chatRecovery = true;
-  waitForMcpConnections = true;
+// ── База знаний (имитация RAG) ────────────────────────────────
+const KNOWLEDGE: Record<string, string> = {
+  "квантовые компьютеры": "Квантовые компьютеры используют кубиты вместо битов. Google Sycamore достиг квантового превосходства в 2019 году. IBM разрабатывает процессоры с 1000+ кубитами. Ключевые применения: криптография, оптимизация, молекулярное моделирование.",
+  "машинное обучение": "Машинное обучение — подраздел ИИ, где модели обучаются на данных без явного программирования. Основные типы: supervised (с учителем), unsupervised (без учителя), reinforcement learning (с подкреплением). Популярные фреймворки: TensorFlow, PyTorch.",
+  "блокчейн": "Блокчейн — распределённый реестр транзакций, защищённый криптографией. Bitcoin использует Proof-of-Work, Ethereum перешёл на Proof-of-Stake в 2022 году. Смарт-контракты позволяют автоматизировать соглашения без посредников.",
+  "cloudflare workers": "Cloudflare Workers — serverless платформа для запуска JavaScript/TypeScript на 300+ edge-серверах. Поддерживает Durable Objects (stateful), KV (key-value), R2 (object storage), Workers AI (LLM inference). Время холодного старта <1ms.",
+  "durable objects": "Durable Objects — stateful вычисления на Cloudflare с уникальным ID, SQLite-хранилищем и WebSocket. Гарантируют single-threaded execution. Идеальны для чатов, игровых сессий, агентов. Состояние переживает редеплои и отказы серверов.",
+  "agents sdk": "Agents SDK — фреймворк Cloudflare для создания AI-агентов. Предоставляет: tools (инструменты), WebSocket streaming, persistent state, scheduling. Агент сам выбирает какие tools вызывать на основе контекста.",
+  "websocket": "WebSocket — протокол двусторонней связи поверх TCP. В отличие от HTTP, соединение остаётся открытым. Используется для real-time приложений: чаты, уведомления, live-обновления. Agents SDK использует hibernatable WebSockets (экономят ресурсы).",
+};
 
-  onStart() {
-    this.mcp.configureOAuthCallback({
-      customHandler: (result) => {
-        if (result.authSuccess) {
-          return new Response("<script>window.close();</script>", {
-            headers: { "content-type": "text/html" },
-            status: 200
-          });
-        }
-        return new Response(
-          `Authentication Failed: ${result.authError || "Unknown error"}`,
-          { headers: { "content-type": "text/plain" }, status: 400 }
-        );
+// ── Слой 1: локальный словарь (детерминированный, без сети) ────
+const KNOWN_CITIES: Record<string, { lat: number; lon: number; region: string }> = {
+  "мурманск":        { lat: 68.9707, lon: 33.0749,  region: "Мурманская область" },
+  "москва":          { lat: 55.7558, lon: 37.6173,  region: "Москва" },
+  "санкт-петербург": { lat: 59.9343, lon: 30.3351,  region: "Ленинградская область" },
+  "спб":             { lat: 59.9343, lon: 30.3351,  region: "Ленинградская область" },
+  "сочи":            { lat: 43.6028, lon: 39.7342,  region: "Краснодарский край" },
+  "казань":          { lat: 55.7887, lon: 49.1221,  region: "Татарстан" },
+  "новосибирск":     { lat: 55.0084, lon: 82.9357,  region: "Новосибирская область" },
+  "екатеринбург":    { lat: 56.8389, lon: 60.6057,  region: "Свердловская область" },
+  "владивосток":     { lat: 43.1155, lon: 131.8855, region: "Приморский край" },
+  "норильск":        { lat: 69.3536, lon: 88.2027,  region: "Красноярский край" },
+  "якутск":          { lat: 62.0355, lon: 129.6755, region: "Саха (Якутия)" },
+};
+
+// ── Транслитерация для запасного запроса латиницей ─────────────
+const TRANSLIT: Record<string, string> = {
+  "а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"e","ж":"zh","з":"z",
+  "и":"i","й":"y","к":"k","л":"l","м":"m","н":"n","о":"o","п":"p","р":"r",
+  "с":"s","т":"t","у":"u","ф":"f","х":"kh","ц":"ts","ч":"ch","ш":"sh",
+  "щ":"shch","ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya",
+};
+function translit(s: string): string {
+  return s.toLowerCase().split("").map((ch) => TRANSLIT[ch] ?? ch).join("");
+}
+
+// ── Геокодинг: ТОЛЬКО точное совпадение, иначе эскалация ───────
+async function geocode(city: string): Promise<{ lat: number; lon: number; name: string; region: string; source: string } | null> {
+  const key = city.trim().toLowerCase();
+
+  // Слой 1: словарь — мгновенно и без сети
+  const local = KNOWN_CITIES[key];
+  if (local) {
+    console.log(`[GEO] layer1 dict: "${city}" → (${local.lat}, ${local.lon})`);
+    return { lat: local.lat, lon: local.lon, name: city, region: local.region, source: "dict" };
+  }
+
+  // Слой 2: Open-Meteo, запросы ru → транслит; принимаем ТОЛЬКО exact match
+  for (const [lang, q] of [["ru", city], ["en", translit(city)]] as const) {
+    try {
+      const res = await fetch(
+        `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(q)}&count=10&language=${lang}`
+      );
+      const geo = await res.json() as { results?: Array<{ latitude: number; longitude: number; name: string; admin1?: string }> };
+      const list = geo.results ?? [];
+      const exact = list.find((r) => r.name.trim().toLowerCase() === q.trim().toLowerCase());
+      if (exact) {
+        console.log(`[GEO] layer2 open-meteo(${lang}) EXACT: "${q}" → (${exact.latitude}, ${exact.longitude})`);
+        return { lat: exact.latitude, lon: exact.longitude, name: exact.name, region: exact.admin1 ?? "", source: `open-meteo:${lang}` };
       }
-    });
+      console.log(`[GEO] layer2 open-meteo(${lang}): ${list.length} candidates, NO exact match — rejected: ` + list.map((r) => r.name).join(", "));
+    } catch (e) {
+      console.log(`[GEO] layer2 open-meteo(${lang}) error:`, e);
+    }
   }
 
-  @callable()
-  async addServer(name: string, url: string) {
-    return await this.addMcpServer(name, url);
+  // Слой 3: OpenStreetMap Nominatim — авторитетный источник
+  try {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(city)}&format=jsonv2&limit=1&accept-language=ru`,
+      { headers: { "User-Agent": "my-first-agent-edu/1.0" } }
+    );
+    const arr = await res.json() as Array<{ lat: string; lon: string; display_name: string }>;
+    if (arr?.[0]) {
+      console.log(`[GEO] layer3 nominatim: "${city}" → (${arr[0].lat}, ${arr[0].lon})`);
+      return { lat: parseFloat(arr[0].lat), lon: parseFloat(arr[0].lon), name: city, region: arr[0].display_name, source: "osm" };
+    }
+  } catch (e) {
+    console.log(`[GEO] layer3 nominatim error:`, e);
   }
 
-  @callable()
-  async removeServer(serverId: string) {
-    await this.removeMcpServer(serverId);
-  }
+  console.log(`[GEO] ALL LAYERS FAILED for "${city}"`);
+  return null;
+}
 
-  async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
-    const mcpTools = this.mcp.getAITools();
+// ── Реальная погода через open-meteo.com ─────────────────────
+async function fetchWeather(city: string): Promise<{ temp: number; condition: string; city: string }> {
+  try {
+    const place = await geocode(city);
+    if (!place) {
+      return { temp: 0, condition: "город не найден: ни один источник не дал точного совпадения", city };
+    }
+
+    const wxRes = await fetch(
+      `https://api.open-meteo.com/v1/forecast?latitude=${place.lat}&longitude=${place.lon}&current=temperature_2m,weather_code`
+    );
+    const wx = await wxRes.json() as { current: { temperature_2m: number; weather_code: number } };
+    const temp = Math.round(wx.current.temperature_2m);
+    const code = wx.current.weather_code;
+    let condition = "облачно";
+    if (code === 0 || code === 1) condition = "ясно";
+    else if (code >= 2 && code <= 3) condition = "облачно";
+    else if (code >= 51 && code <= 67) condition = "дождь";
+    else if (code >= 71 && code <= 77) condition = "снег";
+    else if (code >= 95) condition = "гроза";
+
+    console.log(`[WORKER] fetchWeather: ${city} → ${place.name} [${place.source}] (${place.lat}, ${place.lon}) → ${temp}°C, ${condition}`);
+    return { temp, condition, city: place.name };
+  } catch (e) {
+    console.log("Open-Meteo API error:", e);
+    return { temp: 0, condition: "ошибка API", city };
+  }
+}
+
+// ── Агент ────────────────────────────────────────────────────
+export class ChatAgent extends AIChatAgent<Env> {
+  async onChatMessage() {
     const workersai = createWorkersAI({ binding: this.env.AI });
 
     const result = streamText({
-      model: workersai("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
-        sessionAffinity: this.sessionAffinity
-      }),
-      system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
+      model: workersai("@cf/zai-org/glm-4.7-flash"),
+      system: `You are an AI agent that orchestrates workers to complete tasks.
 
-${getSchedulePrompt({ date: new Date() })}
+## Available workers (tools):
+1. **getWeather** — get current weather for a city (real data from open-meteo.com)
+2. **searchKnowledge** — search the internal knowledge base. Available topics:
+   - квантовые компьютеры (quantum computing)
+   - машинное обучение (machine learning)
+   - блокчейн (blockchain)
+   - cloudflare workers
+   - durable objects
+   - agents sdk
+   - websocket
+3. **generateReport** — create a structured report after completing a multi-step task
 
-If the user asks to schedule a task, use the scheduleTask tool with a clear "when" string (e.g. "in 30 seconds", "in 5 minutes", "2026-01-15T09:00:00Z", or a cron expression like "*/10 * * * *"). Always provide BOTH the "when" and "description" parameters.`,
-      messages: pruneMessages({
-        messages: await convertToModelMessages(this.messages),
-        toolCalls: "before-last-2-messages",
-        reasoning: "before-last-message"
-      }),
+## Workflow rules:
+- For weather questions → use getWeather
+- For technical/knowledge questions → use searchKnowledge
+- If task involved 2+ different tools → call generateReport at the end with summary
+- Always explain which workers you called and what they returned
+- Respond in the same language as the user (Russian if user writes in Russian)
+- If user asks about topics NOT in the knowledge base, politely explain what topics are available
+
+## Example complex task:
+User: "Какая погода в Москве и расскажи про квантовые компьютеры. Сделай отчёт."
+Agent workflow:
+1. Call getWeather({city: "Москва"})
+2. Call searchKnowledge({query: "квантовые компьютеры"})
+3. Call generateReport({task: "...", workers: [...]})
+4. Provide comprehensive answer based on both results`,
+      messages: await convertToModelMessages(this.messages),
       tools: {
-        ...mcpTools,
-
-        // ── Server-side: weather ────────────────────────────────
+        // ── Worker 1: реальная погода ─────────────────────────
         getWeather: tool({
-          description: "Get the current weather for a city",
-          inputSchema: z.object({
-            city: z.string().describe("City name")
+          description: "Get current weather for a city. Returns real data from open-meteo.com API.",
+          inputSchema: z.object({ 
+            city: z.string().describe("City name in any language") 
           }),
           execute: async ({ city }) => {
-            const conditions = ["sunny", "cloudy", "rainy", "snowy"];
-            const temp = Math.floor(Math.random() * 30) + 5;
-            return {
-              city,
-              temperature: temp,
-              condition: conditions[Math.floor(Math.random() * conditions.length)],
-              unit: "celsius"
-            };
-          }
+            console.log(`[TOOL] getWeather called with city="${city}"`);
+            const result = await fetchWeather(city);
+            console.log(`[TOOL] getWeather result:`, result);
+            return result;
+          },
         }),
 
-        // ── Client-side: timezone ──────────────────────────────
-        getUserTimezone: tool({
-          description:
-            "Get the user's timezone from their browser. Use this when you need to know the user's local time.",
-          inputSchema: z.object({})
-        }),
-
-        // ── Approval tool: calculator ──────────────────────────
-        calculate: tool({
-          description:
-            "Perform a math calculation with two numbers. Requires user approval for large numbers.",
-          inputSchema: z.object({
-            a: z.number().describe("First number"),
-            b: z.number().describe("Second number"),
-            operator: z.enum(["+", "-", "*", "/", "%"]).describe("Arithmetic operator")
+        // ── Worker 2: поиск в базе знаний (RAG) ──────────────
+        searchKnowledge: tool({
+          description: "Search the internal knowledge base for technical topics. Available topics: квантовые компьютеры, машинное обучение, блокчейн, cloudflare workers, durable objects, agents sdk, websocket.",
+          inputSchema: z.object({ 
+            query: z.string().describe("What to search for (topic or keyword)") 
           }),
-          needsApproval: async ({ a, b }) => Math.abs(a) > 1000 || Math.abs(b) > 1000,
-          execute: async ({ a, b, operator }) => {
-            const ops: Record<string, (x: number, y: number) => number> = {
-              "+": (x, y) => x + y,
-              "-": (x, y) => x - y,
-              "*": (x, y) => x * y,
-              "/": (x, y) => x / y,
-              "%": (x, y) => x % y
+          execute: async ({ query }) => {
+            console.log(`[TOOL] searchKnowledge called with query="${query}"`);
+            
+            // Имитация задержки worker'а (как реальный RAG)
+            await new Promise(resolve => setTimeout(resolve, 300));
+            
+            const q = query.toLowerCase();
+            const found = Object.entries(KNOWLEDGE).find(([key, value]) =>
+              q.includes(key) || key.includes(q) || value.toLowerCase().includes(q)
+            );
+            
+            const result = {
+              found: !!found,
+              topic: found ? found[0] : null,
+              content: found ? found[1] : "Информация не найдена. Доступные темы: " + Object.keys(KNOWLEDGE).join(", "),
+              source: found ? "internal-knowledge-base" : "none",
+              workerId: "rag-worker-001",
+              searchTime: "300ms",
             };
-            if (operator === "/" && b === 0) return { error: "Division by zero" };
-            return {
-              expression: `${a} ${operator} ${b}`,
-              result: ops[operator](a, b)
+            
+            console.log(`[TOOL] searchKnowledge result:`, result);
+            return result;
+          },
+        }),
+
+        // ── Worker 3: генерация отчёта ───────────────────────
+        generateReport: tool({
+          description: "Generate a structured report summarizing what workers accomplished. Use this after completing a complex task that involved multiple workers.",
+          inputSchema: z.object({
+            task: z.string().describe("Original user task"),
+            workers: z.array(z.object({
+              name: z.string().describe("Worker name (getWeather, searchKnowledge)"),
+              action: z.string().describe("What the worker did"),
+              result: z.string().describe("Brief summary of result"),
+            })).describe("List of workers that were called"),
+          }),
+          execute: async ({ task, workers }) => {
+            console.log(`[TOOL] generateReport called with task="${task}", workers:`, workers);
+            
+            const report = {
+              taskId: `task-${Date.now()}`,
+              task,
+              workersInvoked: workers.length,
+              workerDetails: workers,
+              status: "completed",
+              timestamp: new Date().toISOString(),
+              summary: `Задача "${task}" выполнена с использованием ${workers.length} worker(ов): ${workers.map(w => w.name).join(", ")}`,
             };
-          }
+            
+            console.log(`[TOOL] generateReport result:`, report);
+            return report;
+          },
         }),
-
-        // ── FIXED scheduleTask: simple schema, null-guarded ────
-        scheduleTask: tool({
-          description:
-            "Schedule a task to be executed at a later time. Use this when the user asks to be reminded or wants something done later. You MUST provide BOTH 'when' and 'description' parameters.",
-          inputSchema: z.object({
-            when: z
-              .string()
-              .describe(
-                'When to run the task. Examples: "in 30 seconds", "in 5 minutes", "2026-01-15T09:00:00Z", or a cron expression like "*/10 * * * *"'
-              ),
-            description: z.string().describe("A description of what the task should do")
-          }),
-          execute: async ({ when: whenStr, description }) => {
-            try {
-              // ── Null guard: protect against empty input from the model
-              if (!whenStr || typeof whenStr !== "string" || whenStr.trim() === "") {
-                return "ERROR: missing 'when' parameter. Please specify when to schedule (e.g. 'in 30 seconds').";
-              }
-              if (!description || typeof description !== "string" || description.trim() === "") {
-                return "ERROR: missing 'description' parameter. Please describe what to schedule.";
-              }
-
-              let input: number | Date | string;
-              const delayMatch = whenStr.match(/in\s+(\d+)\s+(second|minute|hour)s?/i);
-              const asNum = Number(whenStr);
-
-              if (delayMatch) {
-                const val = parseInt(delayMatch[1]);
-                const unit = delayMatch[2].toLowerCase();
-                input = unit === "second" ? val : unit === "minute" ? val * 60 : val * 3600;
-              } else if (!isNaN(asNum) && whenStr.trim() !== "") {
-                input = asNum;
-              } else if (whenStr.includes("*")) {
-                input = whenStr; // cron expression
-              } else {
-                input = new Date(whenStr);
-              }
-
-              await this.schedule(input, "executeTask", description, {
-                idempotent: true
-              });
-              return `Task scheduled successfully: "${description}" for ${whenStr}`;
-            } catch (error) {
-              const msg = error instanceof Error ? error.message : String(error);
-              return `Error scheduling task: ${msg}`;
-            }
-          }
-        }),
-
-        // ── List scheduled tasks ───────────────────────────────
-        getScheduledTasks: tool({
-          description: "List all tasks that have been scheduled",
-          inputSchema: z.object({}),
-          execute: async () => {
-            const tasks = this.getSchedules();
-            return tasks.length > 0 ? tasks : "No scheduled tasks found.";
-          }
-        }),
-
-        // ── Cancel a scheduled task ────────────────────────────
-        cancelScheduledTask: tool({
-          description: "Cancel a scheduled task by its ID",
-          inputSchema: z.object({
-            taskId: z.string().describe("The ID of the task to cancel")
-          }),
-          execute: async ({ taskId }) => {
-            try {
-              this.cancelSchedule(taskId);
-              return `Task ${taskId} cancelled.`;
-            } catch (error) {
-              const msg = error instanceof Error ? error.message : String(error);
-              return `Error cancelling task: ${msg}`;
-            }
-          }
-        })
       },
-      stopWhen: stepCountIs(10),
-      abortSignal: options?.abortSignal
+      stopWhen: stepCountIs(8),
     });
 
     return result.toUIMessageStreamResponse();
-  }
-
-  async executeTask(description: string, _task: Schedule<string>) {
-    console.log(`Executing scheduled task: ${description}`);
-    this.broadcast(
-      JSON.stringify({
-        type: "scheduled-task",
-        description,
-        timestamp: new Date().toISOString()
-      })
-    );
   }
 }
 
@@ -216,5 +244,5 @@ export default {
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })
     );
-  }
+  },
 } satisfies ExportedHandler<Env>;
