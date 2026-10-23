@@ -280,6 +280,24 @@ function Chat() {
     Array<{ id: number; step: string; message: string; status: string; ts: number }>
   >([]);
   const [feedOpen, setFeedOpen] = useState(true);
+
+  // Гидратация ленты из localStorage (один раз при монтировании)
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("progress-feed");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) setProgress(parsed);
+      }
+    } catch { /* игнорируем битый JSON */ }
+  }, []);
+
+  // Персист ленты при каждом изменении (последние 50 событий)
+  useEffect(() => {
+    try {
+      localStorage.setItem("progress-feed", JSON.stringify(progress.slice(-50)));
+    } catch { /* quota и т.п. */ }
+  }, [progress]);
   const [mcpName, setMcpName] = useState("");
   const [mcpUrl, setMcpUrl] = useState("");
   const [isAddingServer, setIsAddingServer] = useState(false);

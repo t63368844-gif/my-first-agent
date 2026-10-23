@@ -45,6 +45,22 @@ function translit(s: string): string {
 type EmitFn = (step: string, message: string, status?: "start" | "done" | "error") => void;
 
 // ── Геокодинг: ТОЛЬКО точное совпадение, иначе эскалация ───────
+// ── Нормализация падежей для русского языка ─────────────────
+function normalizeCity(city: string): string {
+  const suffixes = ["е", "у", "а", "ы", "и", "ом", "ем"];
+  let normalized = city.trim();
+  
+  // Убираем распространённые окончания предложного падежа
+  for (const suffix of suffixes) {
+    if (normalized.endsWith(suffix) && normalized.length > 4) {
+      normalized = normalized.slice(0, -1);
+      break;
+    }
+  }
+  
+  return normalized;
+}
+
 async function geocode(city: string, emit?: EmitFn): Promise<{ lat: number; lon: number; name: string; region: string; source: string } | null> {
   const key = city.trim().toLowerCase();
 
@@ -107,10 +123,36 @@ async function fetchWeather(city: string, emit?: EmitFn): Promise<{ temp: number
     }
 
     emit?.("weather", "Запрашиваю погоду у Open-Meteo…", "start");
-    const wxRes = await fetch(
-      `https://api.open-meteo.com/v1/forecast?latitude=${place.lat}&longitude=${place.lon}&current=temperature_2m,weather_code`
-    );
-    const wx = await wxRes.json() as { current: { temperature_2m: number; weather_code: number } };
+    // Retry loop: 3 попытки при сетевых сбоях Open-Meteo
+    let wx: { current?: { temperature_2m: number; weather_code: number } } | null = null;
+    let lastErr: unknown = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const wxRes = await fetch(
+          `https://api.open-meteo.com/v1/forecast?latitude=${place.lat}&longitude=${place.lon}&current=temperature_2m,weather_code`
+        );
+        if (!wxRes.ok) throw new Error(`HTTP ${wxRes.status}`);
+        const data = await wxRes.json() as typeof wx;
+        if (data?.current?.temperature_2m !== undefined) {
+          wx = data;
+          break;
+        }
+        throw new Error("empty current data");
+      } catch (e) {
+        lastErr = e;
+        if (attempt < 3) {
+          await new Promise((r) => setTimeout(r, 300 * attempt));
+          emit?.("weather", `Попытка ${attempt}/3: ${e instanceof Error ? e.message : "сбой"}`, "error");
+        }
+      }
+    }
+
+    if (!wx?.current) {
+      const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+      emit?.("weather", `Open-Meteo не ответил после 3 попыток: ${msg}`, "error");
+      return { temp: 0, condition: `ошибка API (${msg})`, city: place.name };
+    }
+
     const temp = Math.round(wx.current.temperature_2m);
     const code = wx.current.weather_code;
     let condition = "облачно";
@@ -124,12 +166,13 @@ async function fetchWeather(city: string, emit?: EmitFn): Promise<{ temp: number
     console.log(`[WORKER] fetchWeather: ${city} → ${place.name} [${place.source}] (${place.lat}, ${place.lon}) → ${temp}°C, ${condition}`);
     return { temp, condition, city: place.name };
   } catch (e) {
-    console.log("Open-Meteo API error:", e);
-    return { temp: 0, condition: "ошибка API", city };
+    console.log("Unexpected error in fetchWeather:", e);
+    return { temp: 0, condition: "внутренняя ошибка", city };
   }
 }
 
 // ── Агент ────────────────────────────────────────────────────
+// ── Хранилище PDF-презентаций (in-memory для демонстрации) ──
 export class ChatAgent extends AIChatAgent<Env> {
   progress(step: string, message: string, status: "start" | "done" | "error" = "start") {
     const payload = JSON.stringify({ type: "progress", step, message, status, ts: Date.now() });
@@ -139,6 +182,7 @@ export class ChatAgent extends AIChatAgent<Env> {
 
   async onChatMessage() {
     const workersai = createWorkersAI({ binding: this.env.AI });
+    const env = this.env;  // ← сохраняем для доступа внутри tools
 
     const result = streamText({
       model: workersai("@cf/zai-org/glm-4.7-flash"),
@@ -310,8 +354,60 @@ Agent workflow:
             return { summary };
           },
         }),
+
+        // ── Worker 6: интеграция с ai-creative-studio ────────────
+        createPresentation: tool({
+          description: "Create a PDF presentation on a given topic using the ai-creative-studio service. Returns a download link.",
+          inputSchema: z.object({
+            topic: z.string().describe("Topic of the presentation (e.g. 'Quantum computing basics')"),
+            slideCount: z.number().describe("Number of slides (3-10)"),
+          }),
+          execute: async ({ topic, slideCount }) => {
+            this.progress("presentation", `Заказываю презентацию: «${topic}» (${slideCount} слайдов)…`, "start");
+            
+            const STUDIO_URL = "https://ai-creative-studio.t63368844.workers.dev/pdf";
+            
+            try {
+              const res = await fetch(STUDIO_URL, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ topic, slideCount }),
+              });
+              
+              if (!res.ok) {
+                throw new Error(`Studio returned ${res.status}: ${await res.text()}`);
+              }
+              
+              const pdfBuffer = await res.arrayBuffer();
+              const sizeKB = Math.round(pdfBuffer.byteLength / 1024);
+              
+              // Сохраняю PDF в KV (на 7 дней)
+              const pdfId = `pdf-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+              await env.PDF_STORE.put(pdfId, pdfBuffer, {
+                expirationTtl: 7 * 24 * 60 * 60, // 7 дней
+                metadata: { topic, slideCount, createdAt: Date.now() }
+              });
+              
+              this.progress("presentation", `PDF готов (${sizeKB} KB), сохранён в KV`, "done");
+              
+              const downloadUrl = `https://my-first-agent.t63368844.workers.dev/download?id=${pdfId}`;
+              
+              return {
+                success: true,
+                size: `${sizeKB} KB`,
+                pdfId,
+                downloadUrl,
+                message: `Презентация создана и сохранена. [Скачать PDF](${downloadUrl})`,
+              };
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              this.progress("presentation", `Ошибка: ${msg}`, "error");
+              return { success: false, error: msg };
+            }
+          },
+        }),
       },
-      stopWhen: stepCountIs(8),
+      stopWhen: stepCountIs(10),
     });
 
     return result.toUIMessageStreamResponse();
@@ -320,6 +416,48 @@ Agent workflow:
 
 export default {
   async fetch(request: Request, env: Env) {
+    const url = new URL(request.url);
+    
+    // GET /download?id=... — отдаёт PDF из KV
+    if (request.method === "GET" && url.pathname === "/download") {
+      const pdfId = url.searchParams.get("id");
+      
+      if (!pdfId) {
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      
+      try {
+        const pdfBytes = await env.PDF_STORE.get(pdfId, "arrayBuffer");
+        
+        if (!pdfBytes) {
+          return new Response(JSON.stringify({ error: "PDF not found or expired", id: pdfId }), {
+            status: 404,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        
+        const filename = pdfId.replace("pdf-", "presentation-") + ".pdf";
+        
+        return new Response(pdfBytes, {
+          headers: {
+            "Content-Type": "application/pdf",
+            "Content-Disposition": `attachment; filename="${filename}"`,
+            "Cache-Control": "public, max-age=3600",
+          },
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(JSON.stringify({ error: "Download failed", details: msg }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+    
+    // Всё остальное — в агент
     return (
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })
