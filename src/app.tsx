@@ -907,7 +907,20 @@ function Chat() {
                   <div key={ev.id} className="flex items-center gap-2 text-xs font-mono">
                     <span>{ev.status === "done" ? "✅" : ev.status === "error" ? "⛔" : "⏳"}</span>
                     <span className="text-kumo-inactive">
-                      {new Date(ev.ts).toLocaleTimeString()}
+                      {(() => {
+                        const d = new Date(ev.ts);
+                        const now = new Date();
+                        const isToday = d.toDateString() === now.toDateString();
+                        const isYesterday = d.toDateString() === new Date(now.getTime() - 86400000).toDateString();
+                        
+                        if (isToday) {
+                          return d.toLocaleTimeString();
+                        } else if (isYesterday) {
+                          return `вчера ${d.toLocaleTimeString()}`;
+                        } else {
+                          return `${d.toLocaleDateString()} ${d.toLocaleTimeString()}`;
+                        }
+                      })()}
                     </span>
                     <span className="text-kumo-subtle">[{ev.step}]</span>
                     <span className="text-kumo-default">{ev.message}</span>

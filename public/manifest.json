@@ -1,0 +1,11 @@
+{
+  "name": "My First Agent",
+  "short_name": "Agent",
+  "start_url": "/",
+  "display": "standalone",
+  "theme_color": "#f6821f",
+  "icons": [
+    {"src": "/icon.svg", "sizes": "192x192", "type": "image/svg+xml"},
+    {"src": "/icon.svg", "sizes": "512x512", "type": "image/svg+xml"}
+  ]
+}

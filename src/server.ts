@@ -173,11 +173,92 @@ async function fetchWeather(city: string, emit?: EmitFn): Promise<{ temp: number
 
 // ── Агент ────────────────────────────────────────────────────
 // ── Хранилище PDF-презентаций (in-memory для демонстрации) ──
+// ── Single-flight: одновременные одинаковые заказы = один рендер ──
+const STUDIO_INFLIGHT = new Map<string, Promise<ArrayBuffer>>();
+
+async function renderAtStudio(topic: string, slideCount: number, emit?: EmitFn): Promise<ArrayBuffer> {
+  const key = `${topic.toLowerCase()}|${slideCount}`;
+  const existing = STUDIO_INFLIGHT.get(key);
+  if (existing) {
+    emit?.("presentation", "Рендер уже идёт — подключаюсь к нему", "start");
+    return existing;
+  }
+  const promise = (async () => {
+    let lastErr = "";
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const res = await fetch("https://ai-creative-studio.t63368844.workers.dev/pdf", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ topic, slideCount }),
+        });
+        if (!res.ok) {
+          lastErr = `Studio ${res.status}: ${(await res.text()).slice(0, 150)}`;
+        } else {
+          return await res.arrayBuffer();
+        }
+      } catch (e) {
+        lastErr = e instanceof Error ? e.message : String(e);
+      }
+      if (attempt < 3) {
+        const wait = attempt === 1 ? 5000 : 15000;
+        emit?.("presentation", `Попытка ${attempt}/3 не удалась (429/500), повтор через ${wait / 1000} с`, "error");
+        await new Promise((r) => setTimeout(r, wait));
+      }
+    }
+    throw new Error(lastErr || "render failed");
+  })();
+  STUDIO_INFLIGHT.set(key, promise);
+  promise.finally(() => STUDIO_INFLIGHT.delete(key));
+  return promise;
+}
+
 export class ChatAgent extends AIChatAgent<Env> {
   progress(step: string, message: string, status: "start" | "done" | "error" = "start") {
     const payload = JSON.stringify({ type: "progress", step, message, status, ts: Date.now() });
     this.broadcast(payload);
     console.log(`[PROGRESS:${status}] ${step}: ${message}`);
+  }
+
+  // ── HTTP-эндпоинт для нативных клиентов (Android app) ────────
+  async onRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (request.method === "POST" && url.pathname.endsWith("/api/chat")) {
+      try {
+        const body = (await request.json()) as { text?: string };
+        const text = (body.text ?? "").trim();
+        if (!text) {
+          return new Response(JSON.stringify({ error: "text is required" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+
+        // Сохраняем сообщение пользователя в историю DO
+        const userMsg = {
+          id: `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          role: "user" as const,
+          parts: [{ type: "text" as const, text }],
+          createdAt: new Date(),
+        };
+        await this.saveMessages([...this.messages, userMsg]);
+
+        // Запускаем агента и возвращаем SSE-стрим (UI Message Stream)
+        return await this.onChatMessage();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return new Response(JSON.stringify({ error: msg }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    return new Response(
+      JSON.stringify({ error: "Not found", hint: "POST /api/chat with {text}" }),
+      { status: 404, headers: { "Content-Type": "application/json" } }
+    );
   }
 
   async onChatMessage() {
@@ -365,20 +446,31 @@ Agent workflow:
           execute: async ({ topic, slideCount }) => {
             this.progress("presentation", `Заказываю презентацию: «${topic}» (${slideCount} слайдов)…`, "start");
             
-            const STUDIO_URL = "https://ai-creative-studio.t63368844.workers.dev/pdf";
-            
             try {
-              const res = await fetch(STUDIO_URL, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ topic, slideCount }),
-              });
-              
-              if (!res.ok) {
-                throw new Error(`Studio returned ${res.status}: ${await res.text()}`);
+              // KV-reuse: та же тема+слайды уже отрендерены? Отдаём готовый PDF
+              const list = await env.PDF_STORE.list({ prefix: "pdf-" });
+              for (const k of list.keys) {
+                const md = k.metadata as { topic?: string; slideCount?: number } | undefined;
+                if (md && md.topic === topic && md.slideCount === slideCount) {
+                  const cachedBuf = await env.PDF_STORE.get(k.name, "arrayBuffer");
+                  if (cachedBuf) {
+                    const cachedKB = Math.round(cachedBuf.byteLength / 1024);
+                    this.progress("presentation", `PDF найден в KV (${k.name}, ${cachedKB} KB) — рендер не нужен`, "done");
+                    const cachedUrl = `https://my-first-agent.t63368844.workers.dev/download?id=${k.name}`;
+                    return {
+                      success: true,
+                      cached: true,
+                      size: `${cachedKB} KB`,
+                      pdfId: k.name,
+                      downloadUrl: cachedUrl,
+                      message: `Презентация уже создавалась ранее. [Скачать PDF](${cachedUrl})`,
+                    };
+                  }
+                }
               }
-              
-              const pdfBuffer = await res.arrayBuffer();
+
+              // Рендер в студии: single-flight + retry при 429/500
+              const pdfBuffer = await renderAtStudio(topic, slideCount, (st, msg, status = "start") => this.progress(st, msg, status));
               const sizeKB = Math.round(pdfBuffer.byteLength / 1024);
               
               // Сохраняю PDF в KV (на 7 дней)
