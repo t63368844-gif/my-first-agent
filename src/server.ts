@@ -527,6 +527,31 @@ Agent workflow:
           },
         }),
 
+        // ── Worker 6.4: скачивание URL ──
+        fetchUrl: tool({
+          description: "Fetch text content from a URL (for reading documentation, skills, etc.)",
+          inputSchema: z.object({
+            url: z.string().url().describe("URL to fetch"),
+          }),
+          execute: async ({ url }) => {
+            this.progress("fetch", `Скачиваю: ${url}…`, "start");
+            try {
+              const res = await fetch(url);
+              if (!res.ok) {
+                this.progress("fetch", `HTTP ${res.status}`, "error");
+                return { error: `HTTP ${res.status}`, url };
+              }
+              const text = await res.text();
+              this.progress("fetch", `Скачано ${text.length} символов`, "done");
+              return { url, length: text.length, content: text };
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              this.progress("fetch", `Ошибка: ${msg}`, "error");
+              return { error: msg, url };
+            }
+          },
+        }),
+
         // ── Worker 6.5: база знаний (скиллы в KV) ──
         listSkills: tool({
           description: "List available knowledge skills with descriptions from frontmatter. Call before complex tasks to see what knowledge exists.",
