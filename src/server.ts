@@ -213,6 +213,34 @@ async function renderAtStudio(topic: string, slideCount: number, emit?: EmitFn):
   return promise;
 }
 
+// ── Bybit Demo Trading: подпись HMAC-SHA256 (криптография живёт в коде) ──
+const BYBIT_BASE = "https://api-demo.bybit.com"; // ТОЛЬКО demo-домен: реальные деньги недоступны
+
+interface BybitEnv { BYBIT_API_KEY: string; BYBIT_API_SECRET: string }
+
+async function bybitHeaders(env: Env, method: "GET" | "POST", path: string, queryOrBody: string): Promise<Record<string, string>> {
+  const benv = env as unknown as BybitEnv;
+  const timestamp = String(Date.now());
+  const recvWindow = "5000";
+  // Правило v5: payload = timestamp + apiKey + recvWindow + (query для GET | JSON-тело для POST)
+  const payload = timestamp + benv.BYBIT_API_KEY + recvWindow + queryOrBody;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(benv.BYBIT_API_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+  const signature = Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return {
+    "X-BAPI-API-KEY": benv.BYBIT_API_KEY,
+    "X-BAPI-SIGN": signature,
+    "X-BAPI-TIMESTAMP": timestamp,
+    "X-BAPI-RECV-WINDOW": recvWindow,
+  };
+}
+
 export class ChatAgent extends AIChatAgent<Env> {
   progress(step: string, message: string, status: "start" | "done" | "error" = "start") {
     const payload = JSON.stringify({ type: "progress", step, message, status, ts: Date.now() });
@@ -496,6 +524,189 @@ Agent workflow:
               this.progress("presentation", `Ошибка: ${msg}`, "error");
               return { success: false, error: msg };
             }
+          },
+        }),
+
+        // ── Worker 6.5: база знаний (скиллы в KV) ──
+        listSkills: tool({
+          description: "List available knowledge skills with descriptions from frontmatter. Call before complex tasks to see what knowledge exists.",
+          inputSchema: z.object({}),
+          execute: async () => {
+            const list = await env.SKILLS.list();
+            const skills = [];
+            for (const k of list.keys) {
+              const text = await env.SKILLS.get(k.name);
+              const descMatch = text?.match(/^description:\s*(.+)$/m);
+              skills.push({
+                name: k.name,
+                description: descMatch ? descMatch[1].trim() : "no description",
+              });
+            }
+            this.progress("skills", `Доступно знаний: ${skills.length}`, "done");
+            return { skills };
+          },
+        }),
+
+        readSkill: tool({
+          description: "Read the full text of a knowledge skill by name (e.g. 'risk-rules', 'order-types'). Use BEFORE complex Bybit operations.",
+          inputSchema: z.object({
+            name: z.string().describe("Skill name without .md, e.g. 'risk-rules'"),
+          }),
+          execute: async ({ name }) => {
+            this.progress("skills", `Читаю знание: ${name}…`, "start");
+            const text = await env.SKILLS.get(name);
+            if (!text) {
+              const list = await env.SKILLS.list();
+              this.progress("skills", `Скилл ${name} не найден`, "error");
+              return { error: "skill not found", available: list.keys.map((k) => k.name) };
+            }
+            this.progress("skills", `Прочитано ${text.length} символов: ${name}`, "done");
+            return { name, content: text };
+          },
+        }),
+
+        // ── Worker 7: цена с Bybit (публичный endpoint, без подписи) ──
+        getBybitPrice: tool({
+          description: "Get current price of a symbol from Bybit demo market. Symbols: BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT.",
+          inputSchema: z.object({
+            symbol: z.string().describe("Trading pair, e.g. BTCUSDT"),
+          }),
+          execute: async ({ symbol }) => {
+            this.progress("bybit", `Запрашиваю цену ${symbol}…`, "start");
+            const res = await fetch(`${BYBIT_BASE}/v5/market/tickers?category=spot&symbol=${symbol}`);
+            const json = (await res.json()) as { result?: { list?: Array<Record<string, string>> } };
+            const row = json.result?.list?.[0];
+            if (!row) {
+              this.progress("bybit", `Символ ${symbol} не найден`, "error");
+              return { error: "symbol not found", symbol };
+            }
+            this.progress("bybit", `${symbol} = ${row.lastPrice} USDT`, "done");
+            return { symbol, lastPrice: row.lastPrice, change24h: row.price24hPcnt, high24h: row.high24h, low24h: row.low24h };
+          },
+        }),
+
+        // ── Worker 8: баланс демо-аккаунта (приватный, с подписью) ──
+        getBybitBalance: tool({
+          description: "Get demo account wallet balances (USDT, USDC, BTC, ETH) from Bybit.",
+          inputSchema: z.object({}),
+          execute: async () => {
+            this.progress("bybit", "Подписываю запрос баланса (HMAC-SHA256)…", "start");
+            const path = "/v5/account/wallet-balance";
+            const query = "accountType=UNIFIED";
+            const headers = await bybitHeaders(env, "GET", path, query);
+            const res = await fetch(BYBIT_BASE + path + "?" + query, { headers });
+            const json = (await res.json()) as { retCode: number; retMsg: string; result?: { list?: Array<{ coin?: Array<{ coin: string; walletBalance: string }> }> } };
+            if (json.retCode !== 0) {
+              this.progress("bybit", `Bybit отклонил запрос: ${json.retMsg}`, "error");
+              return { error: json.retMsg, retCode: json.retCode };
+            }
+            const coins = json.result?.list?.[0]?.coin ?? [];
+            const balances = coins
+              .map((c) => ({ coin: c.coin, walletBalance: c.walletBalance }))
+              .filter((c) => parseFloat(c.walletBalance) > 0);
+            this.progress("bybit", `Баланс: ${balances.map((b) => `${b.coin}=${b.walletBalance}`).join(", ")}`, "done");
+            return { balances };
+          },
+        }),
+
+        // ── Worker 8.5: параметры инструмента (чтобы агент знал точные лимиты) ──
+        getBybitInstrumentInfo: tool({
+          description: "Get trading rules and limits for a symbol on Bybit demo (min/max qty, price precision). Call BEFORE placing any order to know the exact limits.",
+          inputSchema: z.object({
+            symbol: z.string().describe("e.g. BTCUSDT"),
+          }),
+          execute: async ({ symbol }) => {
+            this.progress("bybit", `Узнаю правила торговли ${symbol}…`, "start");
+            const res = await fetch(`${BYBIT_BASE}/v5/market/instruments-info?category=spot&symbol=${symbol}`);
+            const json = (await res.json()) as { result?: { list?: Array<any> } };
+            const inst = json.result?.list?.[0];
+            if (!inst) {
+              this.progress("bybit", `Символ ${symbol} не найден`, "error");
+              return { error: "symbol not found", symbol };
+            }
+            const info = {
+              symbol: inst.symbol,
+              baseCoin: inst.baseCoin,
+              quoteCoin: inst.quoteCoin,
+              minOrderQty: inst.lotSizeFilter?.minOrderQty,
+              maxOrderQty: inst.lotSizeFilter?.maxOrderQty,
+              qtyStep: inst.lotSizeFilter?.qtyStep,
+              minPrice: inst.priceFilter?.tickSize,
+              status: inst.status,
+            };
+            this.progress("bybit", `${symbol}: min=${info.minOrderQty}, max=${info.maxOrderQty}`, "done");
+            return info;
+          },
+        }),
+
+        // ── Worker 9: ордер с guardrails (только spot, лимиты, подтверждение) ──
+        placeBybitOrder: tool({
+          description: "Place a SPOT Market order on Bybit DEMO account. CRITICAL: for BUY orders use amountUSDT (spend USDT); for SELL orders use qtyBase (sell base coin). ALWAYS call getBybitInstrumentInfo and getBybitPrice FIRST.",
+          inputSchema: z.object({
+            symbol: z.string().describe("e.g. BTCUSDT"),
+            side: z.enum(["Buy", "Sell"]),
+            amountUSDT: z.string().optional().describe("For BUY only: USDT amount to spend, e.g. '10' means spend 10 USDT. REQUIRED when side=Buy."),
+            qtyBase: z.string().optional().describe("For SELL only: base coin quantity, e.g. '0.001' means sell 0.001 BTC. REQUIRED when side=Sell."),
+            confirm: z.boolean().describe("MUST be true. Set true ONLY after user explicitly approved this exact order in chat."),
+          }),
+          execute: async ({ symbol, side, amountUSDT, qtyBase, confirm }) => {
+            // Guardrail 1: без явного подтверждения — отклоняем с явным success:false
+            if (!confirm) {
+              this.progress("bybit", "Ордер без подтверждения отклонён", "error");
+              return {
+                success: false,
+                error: "NOT CONFIRMED. Show order details to user, wait for explicit approval, then call again with confirm=true.",
+              };
+            }
+
+            // Валидация: для Buy нужен amountUSDT, для Sell нужен qtyBase
+            if (side === "Buy" && !amountUSDT) {
+              return { success: false, error: "For Buy Market orders, amountUSDT is required (USDT to spend)." };
+            }
+            if (side === "Sell" && !qtyBase) {
+              return { success: false, error: "For Sell Market orders, qtyBase is required (base coin quantity)." };
+            }
+
+            // Guardrail 2: разумные лимиты
+            const usdtAmount = side === "Buy" ? parseFloat(amountUSDT!) : 0;
+            const baseQty = side === "Sell" ? parseFloat(qtyBase!) : 0;
+            if (usdtAmount > 0 && (usdtAmount < 5 || usdtAmount > 10000)) {
+              return { success: false, error: `amountUSDT ${usdtAmount} out of safe range [5, 10000]. Demo min is usually 5-10 USDT.` };
+            }
+            const MAX_BASE: Record<string, number> = { BTCUSDT: 0.5, ETHUSDT: 5, SOLUSDT: 100, XRPUSDT: 5000 };
+            if (baseQty > 0 && MAX_BASE[symbol] !== undefined && baseQty > MAX_BASE[symbol]) {
+              return { success: false, error: `qtyBase ${baseQty} ${symbol} exceeds guardrail ${MAX_BASE[symbol]}` };
+            }
+
+            this.progress("bybit", `Подписываю ордер ${side} ${side === "Buy" ? amountUSDT + " USDT" : qtyBase + " " + symbol}…`, "start");
+            const path = "/v5/order/create";
+            const body: Record<string, string> = { category: "spot", symbol, side, orderType: "Market" };
+            if (side === "Buy") {
+              body.qty = amountUSDT!;           // ← для Buy: qty = сумма в USDT (по документации V5)
+              body.marketUnit = "quoteCoin";    // ← явно указываем единицу измерения
+            } else {
+              body.qty = qtyBase!;              // ← для Sell: qty = количество BTC
+              body.marketUnit = "baseCoin";
+            }
+            const bodyStr = JSON.stringify(body);
+            const headers = await bybitHeaders(env, "POST", path, bodyStr);
+            const res = await fetch(BYBIT_BASE + path, {
+              method: "POST",
+              headers: { ...headers, "Content-Type": "application/json" },
+              body: bodyStr,
+            });
+            const json = (await res.json()) as { retCode: number; retMsg: string; result?: { orderId?: string } };
+            if (json.retCode !== 0) {
+              this.progress("bybit", `Bybit отклонил: ${json.retMsg} (retCode=${json.retCode})`, "error");
+              return {
+                success: false,
+                error: json.retMsg,
+                retCode: json.retCode,
+                hint: "For Buy Market, amountUSDT is USDT amount. For Sell Market, qtyBase is base coin amount. Min ~5-10 USDT per order.",
+              };
+            }
+            this.progress("bybit", `Ордер исполнен: ${json.result?.orderId}`, "done");
+            return { success: true, orderId: json.result?.orderId, symbol, side, executed: side === "Buy" ? `${amountUSDT} USDT` : `${qtyBase} ${symbol}` };
           },
         }),
       },

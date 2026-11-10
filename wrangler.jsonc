@@ -47,6 +47,11 @@
 		{
 			"binding": "PDF_STORE",
 			"id": "59e4399ea788458bafcacaed0819a0e5"
+		},
+		{
+			"binding": "SKILLS",
+			"id": "f8d38a5221064201b561900733ac9ca3",
+			"remote": true
 		}
 	]
 }
